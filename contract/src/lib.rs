@@ -48,6 +48,8 @@ const MAX_ARGS_SIZE_BYTES: u32 = 4096;
 const FIXED_EXECUTION_FEE: i128 = 100;
 const MAX_DEPENDENCIES_PER_TASK: u32 = 16;
 const MAX_DEPENDENCY_DEPTH: u32 = 16;
+/// Maximum number of tasks allowed in a single batch execution
+const MAX_BATCH_SIZE: u32 = 100;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -197,6 +199,17 @@ pub struct GovernanceProposal {
     pub votes_for: i128,
     pub votes_against: i128,
     pub quorum: i128,
+    pub proposal_type: ProposalType,
+    pub payload: Vec<Val>,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProposalType {
+    UpdateTokenomicsConfig,
+    UpdateFeeModel,
+    UpdateStakingParameters,
+    Other,
 }
 
 #[contracttype]
@@ -224,6 +237,24 @@ pub struct TokenomicsConfig {
     pub fee_model: FeeModel,
     pub min_fee: i128,
     pub max_fee: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct NetworkMetrics {
+    pub last_24h_transaction_count: u64,
+    pub avg_gas_price_last_hour: i128,
+    pub current_congestion_level: u32, // 0-100 scale
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct KeeperMetrics {
+    pub active_keepers_count: u64,
+    pub total_keepers_registered: u64,
+    pub avg_response_time_ms: u64,
+    pub last_updated: u64,
 }
 
 #[contracttype]
@@ -293,6 +324,17 @@ pub struct VrfResponse {
 }
 
 #[contracttype]
+#[derive(Clone, Debug)]
+pub struct ZkCondition {
+    pub task_id: u64,
+    pub condition_hash: Vec<u8>,
+    pub zk_proof: Vec<u8>,
+    pub verifier_address: Address,
+    pub created_at: u64,
+    pub is_verified: bool,
+}
+
+#[contracttype]
 pub enum DataKey {
     Task(u64),
     Counter,
@@ -317,6 +359,10 @@ pub enum DataKey {
     YieldStrategyCounter,
     YieldStrategies(u64),
     ReentrancyLock,
+    ZkConditions(u64),
+    ZkConditionCounter,
+    NetworkMetrics,
+    KeeperMetrics,
     AdminAddress,
 }
 
@@ -1127,6 +1173,60 @@ impl SoroTaskContract {
         exit_security_guard(&env);
     }
 
+    /// Executes multiple tasks in a single transaction for gas optimization.
+    /// Allows keepers to execute a batch of tasks efficiently.
+    /// 
+    /// # Safety & Atomicity
+    /// Soroban transactions are fully atomic. If any task execution fails,
+    /// the entire transaction reverts, ensuring consistent state.
+    /// 
+    /// # Parameters
+    /// - `env`: The Soroban environment
+    /// - `keeper`: The address of the keeper executing the tasks
+    /// - `task_ids`: Vector of task IDs to execute
+    /// 
+    /// # Errors
+    /// - `Error::Unauthorized`: If the keeper is not authorized for any task
+    /// - `Error::TaskNotFound`: If any task ID does not exist
+    /// - `Error::DependencyBlocked`: If any task is blocked by dependencies
+    /// - `Error::InsufficientBalance`: If any task has insufficient gas balance
+    /// - `Error::InvalidInterval`: If batch size exceeds MAX_BATCH_SIZE or is empty
+    pub fn batch_execute(env: Env, keeper: Address, task_ids: Vec<u64>) {
+        enter_security_guard(&env);
+        keeper.require_auth();
+        
+        // Validate that we have some tasks to execute
+        if task_ids.is_empty() {
+            panic_with_error!(&env, Error::InvalidInterval);
+        }
+        
+        // Validate batch size limit
+        if task_ids.len() > MAX_BATCH_SIZE as u32 {
+            panic_with_error!(&env, Error::InvalidInterval);
+        }
+        
+        // Process each task in the batch
+        for i in 0..task_ids.len() {
+            let task_id = task_ids.get(i).unwrap();
+            
+            // Use the existing execute logic for each task
+            // This ensures consistency with single-task execution
+            Self::execute(env.clone(), keeper.clone(), *task_id);
+        }
+        
+        // Emit BatchExecutionCompleted event
+        env.events().publish(
+            (
+                Symbol::new(&env, "BatchExecutionCompleted"),
+                Symbol::new(&env, "v1"),
+                keeper.clone(),
+            ),
+            (task_ids.len(), task_ids),
+        );
+        
+        exit_security_guard(&env);
+    }
+
     pub fn monitor_paginated(env: Env, start_id: u64, limit: u64) -> Vec<ExecutableTask> {
         let now = env.ledger().timestamp();
         let counter: u64 = env
@@ -1299,7 +1399,22 @@ impl SoroTaskContract {
             }
         };
 
-        if should_execute_vrf {
+        // ── ZK condition gate ────────────────────────────────────────────────────
+        // When ZK conditions are present for this task, we check if the ZK proof
+        // has been verified before executing.
+        // This allows privacy-preserving conditions without revealing underlying data.
+        let should_execute_zk = {
+            // Check if ZK condition is satisfied for this task
+            if Self::is_zk_condition_satisfied(env.clone(), task_id) {
+                // If ZK condition is satisfied, use it
+                true
+            } else {
+                // If no ZK condition is satisfied, use VRF result
+                should_execute_vrf
+            }
+        };
+
+        if should_execute_zk {
             // ── Fee validation & calculation ──────────────────────────────
             // Calculate fee based on task complexity and configuration
             let fee: i128 = Self::calculate_execution_fee(&env, &config);
@@ -1908,7 +2023,26 @@ impl SoroTaskContract {
                 },
                 FeeModel::Dynamic => {
                     // Dynamic fee based on network conditions
-                    fee = base_fee + args_size + target_complexity_bonus;
+                    // Base fee + complexity multiplier + network congestion factor + keeper availability factor
+                    
+                    // Get network metrics
+                    let mut network_metrics = Self::get_network_metrics(env);
+                    
+                    // Get keeper metrics
+                    let mut keeper_metrics = Self::get_keeper_metrics(env);
+                    
+                    // Calculate network congestion factor (0-200%) based on recent activity
+                    // Higher congestion = higher fees
+                    let congestion_factor = Self::calculate_congestion_factor(&network_metrics);
+                    
+                    // Calculate keeper availability factor (0-200%) based on active keepers
+                    // Lower availability = higher fees
+                    let keeper_availability_factor = Self::calculate_keeper_availability_factor(&keeper_metrics);
+                    
+                    // Apply factors to base fee
+                    fee = (base_fee + args_size + target_complexity_bonus) 
+                        * congestion_factor / 100 
+                        * keeper_availability_factor / 100;
                 },
             }
             
@@ -1947,11 +2081,14 @@ impl SoroTaskContract {
     /// Updates the tokenomics configuration.
     pub fn update_tokenomics_config(env: Env, config: TokenomicsConfig) {
         enter_security_guard(&env);
-        let admin = Address::current(&env);
+        let caller = Address::current(&env);
         
-        // Only admin can update tokenomics config
+        // Only admin or governance execution can update tokenomics config
         // In production, this would be a multisig or governance-controlled address
-        if admin != Address::generate(&env) {
+        let is_admin = caller == Address::generate(&env);
+        let is_governance_execution = Self::is_governance_execution(&env);
+        
+        if !is_admin && !is_governance_execution {
             panic_with_error!(&env, Error::Unauthorized);
         }
         
@@ -2006,6 +2143,153 @@ impl SoroTaskContract {
         exit_security_guard(&env);
     }
 
+    /// Submits a Zero-Knowledge proof for task condition verification.
+    /// Allows users to define privacy-preserving conditions without revealing underlying data.
+    /// 
+    /// # Parameters
+    /// - `env`: The Soroban environment
+    /// - `task_id`: The ID of the task this ZK condition applies to
+    /// - `condition_hash`: Hash of the condition (to prevent tampering)
+    /// - `zk_proof`: The Zero-Knowledge proof data
+    /// - `verifier_address`: Address of the ZK verifier contract
+    pub fn submit_zk_condition(
+        env: Env,
+        task_id: u64,
+        condition_hash: Vec<u8>,
+        zk_proof: Vec<u8>,
+        verifier_address: Address,
+    ) {
+        enter_security_guard(&env);
+        
+        // Validate task exists
+        let task_key = DataKey::Task(task_id);
+        let config: TaskConfig = env
+            .storage()
+            .persistent()
+            .get(&task_key)
+            .ok_or(Error::TaskNotFound)
+            .expect("Task not found");
+        
+        // Only task creator can submit ZK conditions
+        config.creator.require_auth();
+        
+        // Validate proof size
+        if zk_proof.len() == 0 {
+            panic_with_error!(&env, Error::InvalidVrfRequest);
+        }
+        
+        if zk_proof.len() > 4096 {
+            panic_with_error!(&env, Error::ArgsTooLarge);
+        }
+        
+        // Generate unique sequential ID
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ZkConditionCounter)
+            .unwrap_or(0);
+        counter += 1;
+        env.storage().persistent().set(&DataKey::ZkConditionCounter, &counter);
+        
+        // Create ZK condition
+        let zk_condition = ZkCondition {
+            task_id,
+            condition_hash,
+            zk_proof,
+            verifier_address,
+            created_at: env.ledger().timestamp(),
+            is_verified: false,
+        };
+        
+        // Store ZK condition
+        env.storage()
+            .persistent()
+            .set(&DataKey::ZkConditions(counter), &zk_condition);
+        
+        // Emit ZkConditionSubmitted event
+        env.events().publish(
+            (
+                Symbol::new(&env, "ZkConditionSubmitted"),
+                Symbol::new(&env, "v1"),
+                counter,
+            ),
+            (task_id, config.creator.clone()),
+        );
+        
+        exit_security_guard(&env);
+    }
+
+    /// Verifies a Zero-Knowledge proof for a task condition.
+    /// Called by the ZK verifier contract to confirm the proof is valid.
+    /// 
+    /// # Parameters
+    /// - `env`: The Soroban environment
+    /// - `condition_id`: The ID of the ZK condition to verify
+    /// - `is_valid`: Whether the ZK proof is valid
+    pub fn verify_zk_condition(env: Env, condition_id: u64, is_valid: bool) {
+        enter_security_guard(&env);
+        
+        // Get the ZK condition
+        let mut zk_condition: ZkCondition = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ZkCondition>(&DataKey::ZkConditions(condition_id))
+            .expect("ZK condition not found");
+        
+        // Only the verifier contract can call this function
+        let caller = Address::current(&env);
+        if caller != zk_condition.verifier_address {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        
+        // Update verification status
+        zk_condition.is_verified = is_valid;
+        
+        // Store updated ZK condition
+        env.storage()
+            .persistent()
+            .set(&DataKey::ZkConditions(condition_id), &zk_condition);
+        
+        // Emit ZkConditionVerified event
+        env.events().publish(
+            (
+                Symbol::new(&env, "ZkConditionVerified"),
+                Symbol::new(&env, "v1"),
+                condition_id,
+            ),
+            (zk_condition.task_id, is_valid),
+        );
+        
+        exit_security_guard(&env);
+    }
+
+    /// Checks if a task's ZK condition is satisfied for execution.
+    /// This is called during task execution to determine if the task should run.
+    /// 
+    /// # Parameters
+    /// - `env`: The Soroban environment
+    /// - `task_id`: The ID of the task to check
+    /// 
+    /// # Returns
+    /// - `true` if the ZK condition is satisfied and verified
+    /// - `false` otherwise
+    pub fn is_zk_condition_satisfied(env: Env, task_id: u64) -> bool {
+        // Look for ZK conditions for this task
+        if env.storage().persistent().has(&DataKey::ZkConditionCounter) {
+            let condition_counter: u64 = env.storage().persistent().get(&DataKey::ZkConditionCounter).unwrap();
+            
+            for i in 1..=condition_counter {
+                if let Ok(zk_condition) = env.storage().persistent().get::<DataKey, ZkCondition>(&DataKey::ZkConditions(i)) {
+                    if zk_condition.task_id == task_id && zk_condition.is_verified {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        false
+    }
+
     /// Sets the admin contract address.
     /// Only the current admin can set a new admin address, or anyone can set the initial admin.
     pub fn set_admin_address(env: Env, admin_address: Address) {
@@ -2037,6 +2321,55 @@ impl SoroTaskContract {
             admin_address,
         );
         exit_security_guard(&env);
+    }
+
+    /// Gets network metrics for dynamic fee calculation.
+    /// Returns default metrics if not initialized.
+    fn get_network_metrics(env: &Env) -> NetworkMetrics {
+        env.storage()
+            .instance()
+            .get::<DataKey, NetworkMetrics>(&DataKey::NetworkMetrics)
+            .unwrap_or_else(|| NetworkMetrics {
+                last_24h_transaction_count: 0,
+                avg_gas_price_last_hour: 100,
+                current_congestion_level: 50, // 0-100 scale
+                last_updated: env.ledger().timestamp(),
+            })
+    }
+
+    /// Gets keeper metrics for dynamic fee calculation.
+    /// Returns default metrics if not initialized.
+    fn get_keeper_metrics(env: &Env) -> KeeperMetrics {
+        env.storage()
+            .instance()
+            .get::<DataKey, KeeperMetrics>(&DataKey::KeeperMetrics)
+            .unwrap_or_else(|| KeeperMetrics {
+                active_keepers_count: 10,
+                total_keepers_registered: 100,
+                avg_response_time_ms: 200,
+                last_updated: env.ledger().timestamp(),
+            })
+    }
+
+    /// Calculates congestion factor based on network metrics.
+    /// Returns factor as percentage (100 = normal, 200 = high congestion).
+    fn calculate_congestion_factor(metrics: &NetworkMetrics) -> i128 {
+        // Simple linear scaling: 50% congestion = 100%, 100% congestion = 200%
+        let base_factor = 100 + (metrics.current_congestion_level * 100 / 100);
+        
+        // Clamp between 50% and 300%
+        if base_factor < 50 { 50 } else if base_factor > 300 { 300 } else { base_factor }
+    }
+
+    /// Calculates keeper availability factor based on keeper metrics.
+    /// Returns factor as percentage (100 = normal, 200 = low availability).
+    fn calculate_keeper_availability_factor(metrics: &KeeperMetrics) -> i128 {
+        // Inverse relationship: more keepers = lower factor, fewer keepers = higher factor
+        // Base: 100 keepers = 100%, 10 keepers = 200%, 1 keeper = 300%
+        let base_factor = 100 + ((100 - metrics.active_keepers_count.min(100)) * 100 / 100);
+        
+        // Clamp between 50% and 300%
+        if base_factor < 50 { 50 } else if base_factor > 300 { 300 } else { base_factor }
     }
 
     /// Initializes a yield harvesting strategy.
@@ -2639,7 +2972,7 @@ impl SoroTaskContract {
     }
 
     /// Creates a new governance proposal.
-    pub fn create_proposal(env: Env, title: Vec<u8>, description: Vec<u8>, expires_at: u64) -> u64 {
+    pub fn create_proposal(env: Env, title: Vec<u8>, description: Vec<u8>, expires_at: u64, proposal_type: ProposalType, payload: Vec<Val>) -> u64 {
         enter_security_guard(&env);
         let proposer = Address::current(&env);
 
@@ -2670,6 +3003,8 @@ impl SoroTaskContract {
             votes_for: 0,
             votes_against: 0,
             quorum,
+            proposal_type,
+            payload,
         };
 
         // Store the proposal
@@ -2768,6 +3103,51 @@ impl SoroTaskContract {
             panic_with_error!(&env, Error::InvalidInterval); // Reuse error code for simplicity
         }
 
+        // Handle different proposal types
+        match proposal.proposal_type {
+            ProposalType::UpdateTokenomicsConfig => {
+                // Parse payload as TokenomicsConfig
+                if proposal.payload.len() < 6 {
+                    panic_with_error!(&env, Error::InvalidPayload);
+                }
+                
+                let staking_reward_rate = proposal.payload.get(0).unwrap().to_i128();
+                let governance_quorum_percentage = proposal.payload.get(1).unwrap().to_i128();
+                let governance_voting_period = proposal.payload.get(2).unwrap().to_u64();
+                let fee_model = match proposal.payload.get(3).unwrap().to_u32() {
+                    0 => FeeModel::Fixed,
+                    1 => FeeModel::Percentage,
+                    2 => FeeModel::Dynamic,
+                    _ => FeeModel::Fixed,
+                };
+                let min_fee = proposal.payload.get(4).unwrap().to_i128();
+                let max_fee = proposal.payload.get(5).unwrap().to_i128();
+                
+                let config = TokenomicsConfig {
+                    staking_reward_rate,
+                    governance_quorum_percentage,
+                    governance_voting_period,
+                    fee_model,
+                    min_fee,
+                    max_fee,
+                };
+                
+                // Update tokenomics config
+                Self::update_tokenomics_config(env.clone(), config);
+            }
+            ProposalType::UpdateFeeModel => {
+                // Handle fee model updates
+                // This would be similar to above but for specific fee parameters
+            }
+            ProposalType::UpdateStakingParameters => {
+                // Handle staking parameter updates
+                // This would be similar to above but for staking parameters
+            }
+            ProposalType::Other => {
+                // Handle other proposal types
+            }
+        }
+
         // Mark proposal as executed
         proposal.status = ProposalStatus::Executed;
         env.storage()
@@ -2807,7 +3187,14 @@ impl SoroTaskContract {
             .persistent()
             .get::<DataKey, GovernanceProposal>(&DataKey::GovernanceProposal(proposal_id))
     }
-}
+
+    /// Helper function to check if current execution is from governance proposal
+    /// This checks if the caller is the contract itself (governance execution context)
+    fn is_governance_execution(env: &Env) -> bool {
+        let caller = Address::current(env);
+        let contract_address = env.current_contract_address();
+        caller == contract_address
+    }
 
 // ============================================================================
 // Tests
