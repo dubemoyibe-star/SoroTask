@@ -88,6 +88,12 @@ function loadConfig() {
     rpcHealthCheckIntervalMs: parseInteger(process.env.RPC_HEALTH_CHECK_INTERVAL_MS, 30000),
     rpcHealthCheckTimeoutMs: parseInteger(process.env.RPC_HEALTH_CHECK_TIMEOUT_MS, 5000),
     rpcLoadBalancingStrategy: process.env.RPC_LOAD_BALANCING_STRATEGY || 'weighted_round_robin',
+    realtimeStreamEnabled: parseBoolean(process.env.REALTIME_STREAM_ENABLED, true),
+    realtimeStreamNamespace: process.env.REALTIME_STREAM_NAMESPACE || '/stream',
+    apiGatewayEnabled: parseBoolean(process.env.API_GATEWAY_ENABLED, true),
+    apiGatewayDefaultCapacity: parseInteger(process.env.API_GATEWAY_DEFAULT_CAPACITY, 120),
+    apiGatewayDefaultRefillPerSecond: parseFloat(process.env.API_GATEWAY_DEFAULT_REFILL_PER_SECOND) || 2,
+    apiGatewayDefaultBillingUnits: parseInteger(process.env.API_GATEWAY_DEFAULT_BILLING_UNITS, 1),
     // Inbound Webhooks
     inboundWebhooks: {
       enabled: inboundWebhooksEnabled,
