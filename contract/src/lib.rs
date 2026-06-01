@@ -258,6 +258,26 @@ pub struct RoleAssignment {
 }
 
 /// Permission grant for specific permissions
+
+/// Helper to verify that the caller has the required role or permission
+/// Returns true if the caller is authorized, otherwise panics with Error::Unauthorized.
+fn is_authorized(env: &Env, required_role: Role) {
+    // Get caller address (in Soroban contracts the caller is the address invoking the contract)
+    let caller = env.invoker();
+    // Fetch role assignment if present
+    if let Some(assignment) = get_role_assignment(env, &caller) {
+        if assignment.role == required_role {
+            return;
+        }
+    }
+    // Fetch permission grant and check for AdminAccess permission
+    if let Some(grant) = get_permission_grant(env, &caller) {
+        if grant.permissions.iter().any(|p| *p == Permission::AdminAccess) {
+            return;
+        }
+    }
+    panic_with_error!(env, Error::Unauthorized);
+}
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct PermissionGrant {
@@ -1076,7 +1096,9 @@ impl SoroTaskContract {
         };
         
         // Store VRF request
-        env.storage().persistent().set(&DataKey::VrfRequests(request_counter), &vrf_request);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VrfRequests(request_counter), &vrf_request);
         
         // Emit VrfRequestCreated event
         env.events().publish(
@@ -1310,7 +1332,7 @@ impl SoroTaskContract {
             .get(&task_key)
             .expect("Task not found");
 
-        config.creator.require_auth();
+        require_admin(&env);
 
         if config.is_active {
             panic_with_error!(&env, Error::TaskAlreadyActive);
@@ -1501,7 +1523,7 @@ impl SoroTaskContract {
             .get(&portfolio_key)
             .expect("Portfolio not found");
 
-        portfolio.creator.require_auth();
+        require_admin(&env);
 
         let portfolio_tasks = Self::get_portfolio_tasks(env.clone(), portfolio_id);
 
@@ -2804,9 +2826,12 @@ impl SoroTaskContract {
     /// Updates the tokenomics configuration.
     pub fn update_tokenomics_config(env: Env, config: TokenomicsConfig) {
         enter_security_guard(&env);
-        let caller = env.current_contract_address();
+        let caller = env.invoker();
         
-        // Only admin or governance execution can update tokenomics config
+
+        require_admin(&env);
+        // Existing admin check remains for backward compatibility
+
         // In production, this would be a multisig or governance-controlled address
         let is_admin = caller == env.current_contract_address();
         let is_governance_execution = Self::is_governance_execution(&env);
@@ -2838,10 +2863,13 @@ impl SoroTaskContract {
             .instance()
             .get(&DataKey::AdminAddress);
         
-        // Only admin can set VRF oracle address
+
+        require_admin(&env);
+        // Existing admin check remains for backward compatibility
+
         match admin_address {
             Some(admin) => {
-                let caller = env.current_contract_address();
+                let caller = env.invoker();
                 if caller != admin {
                     panic_with_error!(&env, Error::Unauthorized);
                 }
@@ -2960,7 +2988,7 @@ impl SoroTaskContract {
             .expect("ZK condition not found");
         
         // Only the verifier contract can call this function
-        let caller = env.current_contract_address();
+        let caller = env.invoker();
         if caller != zk_condition.verifier_address {
             panic_with_error!(&env, Error::Unauthorized);
         }
@@ -3110,7 +3138,7 @@ impl SoroTaskContract {
             .expect("Merkle proof not found");
         
         // Only the verifier contract can call this function
-        let caller = env.current_contract_address();
+        let caller = env.invoker();
         if caller != merkle_proof.verifier_address {
             panic_with_error!(&env, Error::Unauthorized);
         }
@@ -3164,11 +3192,15 @@ impl SoroTaskContract {
     }
 
     /// Sets the admin contract address.
+    /// Only callable by an address with the Admin role.
     /// Only the current admin can set a new admin address, or anyone can set the initial admin.
     pub fn set_admin_address(env: Env, admin_address: Address) {
         enter_security_guard(&env);
         
-        // Check if admin address is already set
+
+        require_admin(&env);
+        // Existing admin check remains for backward compatibility
+
         let current_admin: Option<Address> = env
             .storage()
             .instance()
