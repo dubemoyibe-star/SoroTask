@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { CommandPalette } from "@/components/CommandPalette";
+import { AppProviders } from "@/app/components/AppProviders";
 
 export const metadata: Metadata = {
   title: "SoroTask Frontend Performance Monitoring",
