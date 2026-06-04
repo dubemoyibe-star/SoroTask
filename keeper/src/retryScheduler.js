@@ -205,6 +205,14 @@ class RetryScheduler {
       this.budgetTracker.recordRetry(taskId);
     }
 
+    // Record retry delay SLO metric
+    if (this.sloMetrics) {
+      this.sloMetrics.recordRetryDelay({
+        delayMs,
+        attempt: retryMetadata.currentAttempt,
+      });
+    }
+
     // Persist to disk
     await this.persistRetries();
 
