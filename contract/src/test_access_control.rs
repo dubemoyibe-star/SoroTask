@@ -319,8 +319,7 @@ fn test_deposit_gas_authorized_actor_succeeds() {
     let (env, client) = setup_authed();
     let token_admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_admin_client =
-        soroban_sdk::token::StellarAssetClient::new(&env, &token_id.address());
+    let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_id.address());
     client.init(&token_id.address());
 
     let target = env.register_contract(None, MockTarget);
@@ -367,8 +366,7 @@ fn test_withdraw_gas_authorized_actor_succeeds() {
     let (env, client) = setup_authed();
     let token_admin = Address::generate(&env);
     let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_admin_client =
-        soroban_sdk::token::StellarAssetClient::new(&env, &token_id.address());
+    let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_id.address());
     client.init(&token_id.address());
 
     let target = env.register_contract(None, MockTarget);
